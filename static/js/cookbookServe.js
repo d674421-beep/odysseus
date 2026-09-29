@@ -949,9 +949,16 @@ function _ggufFilesForModel(model) {
     : [];
 }
 
+// MTP speculative-decoding heads (mtp-*.gguf) cannot be served on their own.
+// The scan marks them role "draft"; the name check also covers scans cached
+// before that role existed.
+function _isDraftGgufName(name) {
+  return /(^|\/)mtp-[^/]*\.gguf$|-mtp(-[^/]*)?\.gguf$/i.test(String(name || ''));
+}
+
 function _runnableGgufFiles(model) {
   const files = _ggufFilesForModel(model);
-  const primary = files.filter(f => (f.role || 'model') === 'model');
+  const primary = files.filter(f => (f.role || 'model') === 'model' && !_isDraftGgufName(f.rel_path || f.name));
   return primary.length ? primary : files;
 }
 

@@ -397,6 +397,11 @@ def _cached_model_scan_script(model_dirs: list[str] | None = None, add_hf_cache:
         "def gguf_role(name):",
         "    n = name.lower()",
         "    if n.startswith('mmproj') or 'mmproj' in n: return 'projector'",
+        # MTP speculative-decoding heads (e.g. unsloth's MTP/mtp-*.gguf) cannot be
+        # served on their own; llama-server exits with "Gemma4Assistant requires
+        # ctx_other". Keep them out of the runnable list so the UI never defaults
+        # to them (the uppercase MTP/ folder sorts before the real model file).
+        "    if n.startswith('mtp-') or '-mtp-' in n or n.endswith('-mtp.gguf'): return 'draft'",
         "    return 'model'",
         "def gguf_quant(name):",
         "    m = re.search(r'(?i)(UD-)?(IQ[0-9]_[A-Z0-9_]+|Q[0-9](?:_[A-Z0-9]+)+|BF16|F16|FP16|F32|Q8_0)', name)",

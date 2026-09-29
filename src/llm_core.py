@@ -946,6 +946,62 @@ def _host_match(url: str, *domains: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
+def _opencode_plan(url: str) -> Optional[str]:
+    """Return "opencode-go" / "opencode-zen" for OpenCode endpoints, else None.
+
+    Go and Zen share the opencode.ai host and differ only by path
+    (/zen/go/... vs /zen/...), which `_host_match` cannot see.
+    """
+    if not _host_match(url, "opencode.ai"):
+        return None
+    path = (urlparse(url).path or "").lower()
+    if path.startswith("/zen/go/") or path == "/zen/go":
+        return "opencode-go"
+    if path.startswith("/zen/") or path == "/zen":
+        return "opencode-zen"
+    return None
+
+
+# OpenCode serves each model family from a different API shape
+# (https://opencode.ai/docs/zen/, https://opencode.ai/docs/go/).
+# GPT/Grok/Muse Spark only answer on the OpenAI /responses API on both Zen and
+# Go (Go returns 503 "Endpoint is unavailable" on /chat/completions). Zen
+# serves Claude/Qwen on the Anthropic /messages API; Go's Qwen also answers on
+# /chat/completions, so it stays there. Jev (/systemone) is undocumented and
+# stays on chat.
+_OPENCODE_ZEN_ANTHROPIC_PREFIXES = ("claude-", "qwen")
+_OPENCODE_RESPONSES_PREFIXES = ("gpt-", "grok-", "muse-spark")
+
+
+def _opencode_api(url: str, model: str) -> Optional[str]:
+    """Return "anthropic" / "responses" when an OpenCode model needs a non-chat API."""
+    plan = _opencode_plan(url)
+    if not plan:
+        return None
+    name = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if name.startswith(_OPENCODE_RESPONSES_PREFIXES):
+        return "responses"
+    if plan == "opencode-zen" and name.startswith(_OPENCODE_ZEN_ANTHROPIC_PREFIXES):
+        return "anthropic"
+    return None
+
+
+def _parse_responses_output(data: Dict) -> str:
+    """Collect the text of a non-streamed OpenAI Responses API result."""
+    if isinstance(data.get("output_text"), str):
+        return data["output_text"]
+    parts: List[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for block in item.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                parts.append(block.get("text") or "")
+    if not parts and not isinstance(data.get("output"), list):
+        raise ValueError("no Responses output")
+    return "".join(parts)
+
+
 # Kimi Code subscription keys (api.kimi.com/coding/v1) require a whitelisted
 # coding-agent User-Agent; otherwise the API returns 403 access_terminated_error.
 # Tried in order; first success is cached per base URL for later requests.
@@ -1129,10 +1185,9 @@ def _detect_provider(url: str) -> str:
         return "ollama"
     if _host_match(url, "anthropic.com"):
         return "anthropic"
-    if _host_match(url, "opencode.ai/zen/go"):
-        return "opencode-go"
-    if _host_match(url, "opencode.ai/zen"):
-        return "opencode-zen"
+    opencode = _opencode_plan(url)
+    if opencode:
+        return opencode
     if _host_match(url, "openrouter.ai"):
         return "openrouter"
     if _host_match(url, "groq.com"):
@@ -1366,6 +1421,34 @@ def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str
     return h
 
 
+def _apply_opencode_headers(h: Dict[str, str], provider: str, messages: Optional[List[Dict]] = None,
+                            session_id: Optional[str] = None) -> None:
+    """Identify Odysseus to OpenCode Zen/Go, in place.
+
+    OpenCode Go rejects chat requests with HTTP 400 ``MissingSessionID`` unless
+    they carry a stable ``x-opencode-session`` per conversation, and asks
+    clients to send their own User-Agent (https://opencode.ai/docs/go/).
+    The session id is a hash of the Odysseus session id when known, otherwise
+    of the first user message, so every turn of one chat maps to the same id.
+    """
+    if provider not in ("opencode-go", "opencode-zen"):
+        return
+    from src.constants import APP_VERSION
+    h.setdefault("User-Agent", f"odysseus/{APP_VERSION}")
+    if "x-opencode-session" in h:
+        return
+    seed = session_id or ""
+    if not seed:
+        for m in messages or []:
+            if isinstance(m, dict) and m.get("role") == "user":
+                content = m.get("content")
+                seed = content if isinstance(content, str) else json.dumps(content, sort_keys=True, default=str)
+                break
+    if not seed:
+        seed = str(time.time_ns())
+    h["x-opencode-session"] = "odysseus-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
 def _provider_label(url: str) -> str:
     """Human-friendly provider name for error messages."""
     if not url:
@@ -1375,8 +1458,8 @@ def _provider_label(url: str) -> str:
     if _host_match(url, "x.ai"): return "xAI"
     if _host_match(url, "openai.com"): return "OpenAI"
     if _host_match(url, "openrouter.ai"): return "OpenRouter"
-    if _host_match(url, "opencode.ai/zen/go"): return "OpenCode Go"
-    if _host_match(url, "opencode.ai/zen"): return "OpenCode Zen"
+    if _opencode_plan(url) == "opencode-go": return "OpenCode Go"
+    if _opencode_plan(url) == "opencode-zen": return "OpenCode Zen"
     if _host_match(url, "groq.com"): return "Groq"
     from src.chatgpt_subscription import is_chatgpt_subscription_base
     if is_chatgpt_subscription_base(url): return "ChatGPT Subscription"
@@ -2370,6 +2453,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: Optional[f
             headers = None
     if isinstance(headers, dict):
         h.update(headers)
+    _apply_opencode_headers(h, _detect_provider(url), messages)
 
     messages_copy = _sanitize_llm_messages(messages)
 
@@ -2397,9 +2481,13 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: Optional[f
         logger.debug(f"Returning cached response for key: {cache_key}")
         return cached_response
 
+    opencode_api = _opencode_api(url, model)
+    if opencode_api == "anthropic":
+        provider = "anthropic"
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
+        _apply_opencode_headers(h, _opencode_plan(url) or "", messages)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
@@ -2408,6 +2496,11 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: Optional[f
             stream=False, num_ctx=get_context_length(url, model),
         )
         model_customization.apply_sampling(payload, url, model)
+    elif opencode_api == "responses":
+        target_url = _normalize_chatgpt_subscription_url(url)
+        payload = _build_chatgpt_responses_payload(model, messages_copy, temperature, max_tokens)
+        if max_tokens and max_tokens > 0:
+            payload["max_output_tokens"] = max_tokens
     else:
         target_url = _normalize_openai_chat_url(url)
         if provider == "copilot":
@@ -2446,6 +2539,8 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: Optional[f
             response = _parse_anthropic_response(data)
         elif provider == "ollama":
             response = _parse_ollama_response(data)
+        elif opencode_api == "responses":
+            response = _parse_responses_output(data)
         else:
             response = _nonstream_openai_response_text(
                 data["choices"][0]["message"], thinking_mode
@@ -2731,7 +2826,10 @@ async def llm_call_async(
             return cached_response, (_get_cached_response_model(cache_key) or model)
         return cached_response
 
-    if provider == "chatgpt-subscription":
+    opencode_api = _opencode_api(url, model)
+    if opencode_api == "anthropic":
+        provider = "anthropic"
+    if provider == "chatgpt-subscription" or opencode_api == "responses":
         # ChatGPT/Codex requires streamed Responses requests even for callers
         # that want a plain string (auto-title, memory extraction, etc.).
         # Reuse stream_llm's validated Codex SSE path and collect deltas.
@@ -2798,6 +2896,7 @@ async def llm_call_async(
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
+        _apply_opencode_headers(h, _opencode_plan(url) or "", messages, session_id)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
@@ -2812,6 +2911,7 @@ async def llm_call_async(
     else:
         target_url = _normalize_openai_chat_url(url)
         h = _provider_headers(provider, headers)
+        _apply_opencode_headers(h, provider, messages, session_id)
         if provider == "copilot":
             from src.copilot import apply_request_headers
             apply_request_headers(h, messages_copy)
@@ -2980,13 +3080,14 @@ async def llm_call_async(
                 f"POST {target_url} could not be configured: {e}",
             )
 
-def _stream_target_url(url: str) -> str:
+def _stream_target_url(url: str, model: str = "") -> str:
     provider = _detect_provider(url)
-    if provider == "anthropic":
+    opencode_api = _opencode_api(url, model)
+    if provider == "anthropic" or opencode_api == "anthropic":
         return _normalize_anthropic_url(url)
     if provider == "ollama":
         return _normalize_ollama_url(url)
-    if provider == "chatgpt-subscription":
+    if provider == "chatgpt-subscription" or opencode_api == "responses":
         return _normalize_chatgpt_subscription_url(url)
     return _normalize_openai_chat_url(url)
 
@@ -2997,7 +3098,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: Op
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground",
                      thinking_mode: Optional[str] = None, reasoning_effort: Optional[str] = None):
-    target_url = _stream_target_url(url)
+    target_url = _stream_target_url(url, model)
     async with _local_model_slot(target_url, model, workload):
         async for chunk in _stream_llm_inner(
             url,
@@ -3050,9 +3151,15 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     else:
         messages_copy = non_sys
 
+    opencode_api = _opencode_api(url, model)
+    if opencode_api == "anthropic":
+        provider = "anthropic"
+    # OpenAI Responses API streaming: ChatGPT Subscription and Zen GPT/Grok.
+    responses_api = provider == "chatgpt-subscription" or opencode_api == "responses"
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
+        _apply_opencode_headers(h, _opencode_plan(url) or "", messages, session_id)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
@@ -3064,13 +3171,16 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             stream=True, tools=tools, num_ctx=get_context_length(url, model),
         )
         model_customization.apply_sampling(payload, url, model)
-    elif provider == "chatgpt-subscription":
+    elif responses_api:
         target_url = _normalize_chatgpt_subscription_url(url)
         h = _provider_headers(provider, headers)
+        _apply_opencode_headers(h, provider, messages, session_id)
         payload = _build_chatgpt_responses_payload(
             model, messages_copy, temperature, max_tokens, stream=True,
             reasoning_effort=reasoning_effort,
         )
+        if opencode_api == "responses" and max_tokens and max_tokens > 0:
+            payload["max_output_tokens"] = max_tokens
     else:
         target_url = _normalize_openai_chat_url(url)
         payload = {
@@ -3115,6 +3225,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         )
         _scrub_openai_chat_tool_reasoning(payload, target_url, model)
         h = _provider_headers(provider, headers)
+        _apply_opencode_headers(h, provider, messages, session_id)
         if provider == "copilot":
             from src.copilot import apply_request_headers
             apply_request_headers(h, messages_copy)
@@ -3133,8 +3244,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     note_model_activity(target_url, model)
     degenerate_guard = _DegenerateStreamGuard(model)
 
-    # ── ChatGPT Subscription / Codex Responses streaming ──
-    if provider == "chatgpt-subscription":
+    # ── Responses API streaming (ChatGPT Subscription / Codex, OpenCode Zen) ──
+    if responses_api:
         event_name = ""
         input_tokens = 0
         output_tokens = 0
@@ -3146,7 +3257,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                 _clear_host_dead(target_url)
                 if r.status_code != 200:
                     raw = (await r.aread()).decode(errors="replace")
-                    friendly = _format_chatgpt_subscription_error(r.status_code, _chatgpt_safe_error(raw, h))
+                    safe = _chatgpt_safe_error(raw, h)
+                    if provider == "chatgpt-subscription":
+                        friendly = _format_chatgpt_subscription_error(r.status_code, safe)
+                    else:
+                        friendly = _format_upstream_error(r.status_code, safe, target_url)
                     yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly})}\n\n'
                     return
                 async for line in r.aiter_lines():
@@ -3238,7 +3353,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
-            logger.warning("ChatGPT Subscription stream connect failed: %s%s", type(e).__name__, _tail)
+            logger.warning("Responses stream connect failed: %s%s", type(e).__name__, _tail)
             yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n'
         except httpx.ReadTimeout:
             yield f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n'
@@ -3251,8 +3366,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         except httpx.NetworkError:
             yield f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502, "fallback_eligible": False})}\n\n'
         except Exception as e:
-            logger.error("ChatGPT Subscription stream error: %s", type(e).__name__)
-            yield f'event: error\ndata: {json.dumps({"error": "ChatGPT Subscription stream failed", "status": 502, "fallback_eligible": False})}\n\n'
+            logger.error("Responses stream error: %s", type(e).__name__)
+            yield f'event: error\ndata: {json.dumps({"error": "ChatGPT Subscription stream failed" if provider == "chatgpt-subscription" else "Responses stream failed", "status": 502, "fallback_eligible": False})}\n\n'
         return
 
     # ── Native Ollama streaming ──

@@ -61,6 +61,7 @@ def _condition() -> asyncio.Condition:
 
 _PASSIVE_EXACT_PATHS = {
     "/api/activity/heartbeat",
+    "/api/presence",
     "/api/client-perf",
     "/api/tasks/notifications",
     "/api/tasks/runs/recent",

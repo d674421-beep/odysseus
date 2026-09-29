@@ -312,6 +312,7 @@ if AUTH_ENABLED:
         "/api/auth/integrations/presets",
         "/api/health",
         "/api/version",
+        "/api/presence",  # loopback-only tab presence for auto-shutdown
         "/login",
     }
     AUTH_EXEMPT_PREFIXES = ["/static"]
@@ -717,6 +718,10 @@ webhook_manager = WebhookManager(api_key_manager=api_key_manager)
 # Auth
 auth_router = setup_auth_routes(auth_manager)
 app.include_router(auth_router)
+
+# Stop the server once the last browser tab closes (opt-in, desktop launcher).
+from routes.auto_shutdown_routes import setup_auto_shutdown_routes
+app.include_router(setup_auto_shutdown_routes())
 
 
 @app.post("/api/activity/heartbeat")
